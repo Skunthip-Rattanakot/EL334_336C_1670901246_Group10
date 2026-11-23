@@ -1,0 +1,732 @@
+#include "MK64F12.h"      // เรียกใช้ไฟล์ Header สำหรับควบคุมไมโครคอนโทรลเลอร์ MK64F12
+
+#include <stdint.h>        // เรียกใช้ชนิดข้อมูลจำนวนเต็ม เช่น uint8_t และ uint32_t
+
+#include <stdbool.h>    // เรียกใช้ชนิดข้อมูล Boolean คือ true และ false
+
+#include <stdlib.h>      // เรียกใช้ฟังก์ชัน rand() และ srand() สำหรับสุ่มตัวเลข
+
+
+volatile uint32_t msTicks = 0;   // ตัวแปรเก็บเวลาหน่วยมิลลิวินาที โดย volatile ป้องกัน Compiler ใช้ค่าเก่าที่เก็บไว้
+
+
+void SysTick_Handler(void) {    // ฟังก์ชัน Interrupt Service Routine ทำงานเมื่อเกิด SysTick Interrupt
+
+    msTicks++;     // เพิ่มค่าเวลาขึ้น 1 ทุกครั้งที่เกิด Interrupt (ทุก 1 มิลลิวินาที)
+
+}                                 // จบฟังก์ชัน SysTick_Handler
+
+
+void delay_ms(uint32_t ms) {         // ฟังก์ชันหน่วงเวลาตามจำนวนมิลลิวินาทีที่รับเข้ามา
+
+    uint32_t start = msTicks;        // เก็บค่าเวลาปัจจุบันไว้ในตัวแปร start เพื่อใช้เป็นจุดเริ่มต้น
+
+    while ((msTicks - start) < ms);  // วนรอจนกว่าเวลาที่ผ่านไปจะครบตามจำนวน ms ที่กำหนด
+
+}                                    // จบฟังก์ชัน delay_ms
+
+
+void delay_short(void) {             // ฟังก์ชันหน่วงเวลาสั้น ๆ ใช้ควบคุมจังหวะการส่งข้อมูล
+
+    for (volatile int i = 0; i < 60; i++); // วนลูป 60 รอบเพื่อสร้างเวลาหน่วงสั้น ๆ
+
+}                                    // จบฟังก์ชัน delay_short
+
+
+// Common Anode 7-Segment codes (0-9) and digit select (left -> right)
+// ตารางรหัสสำหรับ 7-Segment แบบ Common Anode และการเลือกตำแหน่งหลักจากซ้ายไปขวา
+
+const uint8_t segDigits[10] = { 0xC0, 0xF9, 0xA4, 0xB0, 0x99, 0x92, 0x82, 0xF8, 0x80, 0x90 };
+// อาร์เรย์เก็บรหัสสำหรับแสดงตัวเลข 0-9 บน 7-Segment โดยแต่ละค่าเป็นเลขฐาน 16
+
+const uint8_t segSelect[4]  = { 0xF1, 0xF2, 0xF4, 0xF8 };
+// อาร์เรย์เก็บรหัสเลือกตำแหน่งแสดงผลทั้ง 4 หลัก เรียงจากซ้ายไปขวา
+
+uint8_t displayBuf[4]       = { 0x8C, 0xC7, 0x88, 0x91 }; // อาร์เรย์เก็บข้อมูลที่ต้องการแสดงบนจอ 4 หลัก เริ่มต้นแสดงคำว่า PLAY
+
+
+const char keymap[4][3] = {           // สร้างอาร์เรย์ 2 มิติ สำหรับกำหนดตำแหน่งปุ่มของ Keypad 4 แถว 3 คอลัมน์
+
+    {'1', '2', '3'},                 // แถวที่ 1 มีปุ่ม 1, 2 และ 3
+
+    {'4', '5', '6'},                 // แถวที่ 2 มีปุ่ม 4, 5 และ 6
+
+    {'7', '8', '9'},                 // แถวที่ 3 มีปุ่ม 7, 8 และ 9
+
+    {'*', '0', '#'}                  // แถวที่ 4 มีปุ่ม *, 0 และ #
+
+};                                   // จบการกำหนดตำแหน่งปุ่ม Keypad
+
+
+// Fix 5V PNP Buzzer on 3.3V K64F: Use High-Z Input for OFF, Output LOW for ON
+// ควบคุม Buzzer วงจรทรานซิสเตอร์ PNP 5V โดยใช้ High-Z เพื่อปิด และ Output LOW เพื่อเปิด
+
+
+void buzzerOff(void) {               // ฟังก์ชันปิดเสียง Buzzer
+
+    PTA->PDDR &= ~(1U << 1);         // กำหนด PTA1 เป็น Input หรือ High-Z เพื่อตัดกระแสควบคุมฐานทรานซิสเตอร์ PNP
+
+}                                    // จบฟังก์ชัน buzzerOff
+
+
+void buzzerOn(void) {                // ฟังก์ชันเปิดเสียง Buzzer
+
+    PTA->PCOR = (1U << 1);           // กำหนด Output Latch ของ PTA1 ให้เป็น LOW
+
+    PTA->PDDR |= (1U << 1);          // กำหนด PTA1 เป็น Output ทำให้ขาออกเป็น LOW และเปิดวงจร Buzzer
+
+}                                    // จบฟังก์ชัน buzzerOn
+
+
+void initHardware(void) {            // ฟังก์ชันเริ่มต้นและตั้งค่าขาอุปกรณ์ฮาร์ดแวร์ทั้งหมด
+
+    // Enable Clock for PORT A, B, C, D
+    // เปิด Clock ให้กับ PORT A, B, C และ D เพื่อให้สามารถใช้งาน GPIO ได้
+
+    SIM->SCGC5 |= SIM_SCGC5_PORTA_MASK | SIM_SCGC5_PORTB_MASK |
+                  SIM_SCGC5_PORTC_MASK | SIM_SCGC5_PORTD_MASK;
+    // เปิดใช้งาน Clock ของ PORT A, PORT B, PORT C และ PORT D
+
+
+    // 1. 7-Segment Display (74HC595): Latch=PTB23(D4), CLK=PTC3(D7), DATA=PTC12(D8)
+    // กำหนดขาสำหรับควบคุม 7-Segment ผ่าน IC 74HC595
+
+    PORTB->PCR[23] = PORT_PCR_MUX(1); // ตั้งค่า PTB23 เป็น GPIO ใช้ควบคุมขา Latch
+
+    PORTC->PCR[3]  = PORT_PCR_MUX(1); // ตั้งค่า PTC3 เป็น GPIO ใช้ควบคุมขา Clock
+
+    PORTC->PCR[12] = PORT_PCR_MUX(1); // ตั้งค่า PTC12 เป็น GPIO ใช้ส่งข้อมูล Data
+
+    PTB->PDDR |= (1U << 23);          // กำหนด PTB23 เป็น Output สำหรับส่งสัญญาณ Latch
+
+    PTC->PDDR |= (1U << 3) | (1U << 12); // กำหนด PTC3 และ PTC12 เป็น Output
+
+
+    // 2. 4 LEDs (Lives): D1=PTD1, D2=PTD3, D3=PTD2, D4=PTD0
+    // กำหนดขาสำหรับ LED 4 ดวง ใช้แสดงจำนวนชีวิตของผู้เล่น
+
+    PORTD->PCR[0] = PORT_PCR_MUX(1); // ตั้งค่า PTD0 เป็น GPIO
+
+    PORTD->PCR[1] = PORT_PCR_MUX(1); // ตั้งค่า PTD1 เป็น GPIO
+
+    PORTD->PCR[2] = PORT_PCR_MUX(1); // ตั้งค่า PTD2 เป็น GPIO
+
+    PORTD->PCR[3] = PORT_PCR_MUX(1); // ตั้งค่า PTD3 เป็น GPIO
+
+    PTD->PDDR |= (1U << 0) | (1U << 1) | (1U << 2) | (1U << 3);
+    // กำหนดขา PTD0, PTD1, PTD2 และ PTD3 เป็น Output เพื่อควบคุม LED
+
+
+    // 3. Buzzer = PTA1(D3) -> GPIO mode, no pull resistors, High-Z (OFF)
+    // กำหนด PTA1 เป็น GPIO เพื่อควบคุม Buzzer โดยเริ่มต้นในสถานะปิด
+
+    PORTA->PCR[1] = PORT_PCR_MUX(1); // ตั้งค่า PTA1 เป็น GPIO
+
+    buzzerOff();                     // เรียกฟังก์ชันปิด Buzzer เพื่อให้เริ่มต้นด้วยสถานะ OFF
+
+
+    // 4. Difficulty Switches: S1=PTB3(A1), S2=PTB10(A2), S3=PTB11(A3)
+    // กำหนดขา Switch 3 ตัว สำหรับเลือกระดับความยากของเกม
+
+    PORTB->PCR[3]  = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    // ตั้งค่า PTB3 เป็น GPIO และเปิดใช้งาน Pull-up Resistor สำหรับ Switch S1
+
+    PORTB->PCR[10] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    // ตั้งค่า PTB10 เป็น GPIO และเปิดใช้งาน Pull-up Resistor สำหรับ Switch S2
+
+    PORTB->PCR[11] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    // ตั้งค่า PTB11 เป็น GPIO และเปิดใช้งาน Pull-up Resistor สำหรับ Switch S3
+
+    PTB->PDDR &= ~((1U << 3) | (1U << 10) | (1U << 11));
+    // กำหนด PTB3, PTB10 และ PTB11 เป็น Input เพื่อรับสถานะจาก Switch
+
+
+    // 5. Keypad Rows (Output): R1=PTA2(~5), R2=PTC2(~6), R3=PTC4(~9), R4=PTC10(A5)
+    // กำหนดขา Row ทั้ง 4 แถวของ Keypad เป็น Output
+
+    PORTA->PCR[2]  = PORT_PCR_MUX(1); // ตั้งค่า PTA2 เป็น GPIO สำหรับ Row 1
+
+    PORTC->PCR[2]  = PORT_PCR_MUX(1); // ตั้งค่า PTC2 เป็น GPIO สำหรับ Row 2
+
+    PORTC->PCR[4]  = PORT_PCR_MUX(1); // ตั้งค่า PTC4 เป็น GPIO สำหรับ Row 3
+
+    PORTC->PCR[10] = PORT_PCR_MUX(1); // ตั้งค่า PTC10 เป็น GPIO สำหรับ Row 4
+
+    PTA->PDDR |= (1U << 2);            // กำหนด PTA2 เป็น Output
+
+    PTC->PDDR |= (1U << 2) | (1U << 4) | (1U << 10);
+    // กำหนด PTC2, PTC4 และ PTC10 เป็น Output
+
+
+    // 6. Keypad Columns (Input + Pull-Up): C1=PTC11(A4), C2=PTB9(D2), C3=PTC17(D1)
+    // กำหนดขา Column ทั้ง 3 คอลัมน์เป็น Input และเปิด Pull-up Resistor
+
+    PORTC->PCR[11] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    // ตั้งค่า PTC11 เป็น GPIO และเปิด Pull-up Resistor สำหรับ Column 1
+
+    PORTB->PCR[9]  = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    // ตั้งค่า PTB9 เป็น GPIO และเปิด Pull-up Resistor สำหรับ Column 2
+
+    PORTC->PCR[17] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    // ตั้งค่า PTC17 เป็น GPIO และเปิด Pull-up Resistor สำหรับ Column 3
+
+    PTC->PDDR &= ~((1U << 11) | (1U << 17));
+    // กำหนด PTC11 และ PTC17 เป็น Input
+
+    PTB->PDDR &= ~(1U << 9);          // กำหนด PTB9 เป็น Input
+
+}                                    // จบฟังก์ชัน initHardware
+
+
+void shiftOutByte(uint8_t val) {      // ฟังก์ชันส่งข้อมูล 8 บิตไปยัง IC 74HC595
+
+    for (int i = 0; i < 8; i++) {     // วนลูปทั้งหมด 8 รอบ เพื่อส่งข้อมูลทีละบิต
+
+        if (val & (0x80 >> i)) {       // ตรวจสอบบิตของข้อมูล โดยเริ่มจากบิตที่มีค่าสูงสุด (MSB)
+
+            PTC->PSOR = (1U << 12);  // กำหนด PTC12 เป็น HIGH เพื่อส่งข้อมูลบิต 1
+
+        } else {                     // หากบิตที่ตรวจสอบมีค่าเป็น 0
+
+            PTC->PCOR = (1U << 12);  // กำหนด PTC12 เป็น LOW เพื่อส่งข้อมูลบิต 0
+
+        }                            // จบเงื่อนไขตรวจสอบบิต
+
+        PTC->PSOR = (1U << 3);        // กำหนด PTC3 เป็น HIGH เพื่อสร้างสัญญาณ Clock
+
+        delay_short();               // หน่วงเวลาสั้น ๆ เพื่อให้ IC รับข้อมูลได้ทัน
+
+        PTC->PCOR = (1U << 3);        // กำหนด PTC3 เป็น LOW เพื่อจบจังหวะ Clock
+
+    }                                // จบการวนส่งข้อมูลครบ 8 บิต
+
+}                                    // จบฟังก์ชัน shiftOutByte
+
+
+void refreshDisplay(void) {           // ฟังก์ชันอัปเดตการแสดงผลบน 7-Segment ทั้ง 4 หลัก
+
+    for (int d = 0; d < 4; d++) {     // วนลูปเลือกตำแหน่งจอแสดงผลตั้งแต่หลักที่ 0 ถึง 3
+
+        PTB->PCOR = (1U << 23);       // กำหนด PTB23 เป็น LOW เพื่อเริ่มส่งข้อมูลผ่าน Latch
+
+        shiftOutByte(displayBuf[d]);  // ส่งรหัส Segment ของตัวเลขหรือตัวอักษรที่ต้องการแสดง
+
+        shiftOutByte(segSelect[d]);   // ส่งรหัสเลือกตำแหน่งหลักของ 7-Segment
+
+        PTB->PSOR = (1U << 23);       // กำหนด PTB23 เป็น HIGH เพื่อ Latch ข้อมูลไปยังเอาต์พุต
+
+        delay_ms(2);                 // หน่วงเวลา 2 มิลลิวินาที ก่อนเปลี่ยนไปแสดงหลักถัดไป
+
+    }                                // จบการวนแสดงผลครบทั้ง 4 หลัก
+
+}                                    // จบฟังก์ชัน refreshDisplay
+
+
+void waitWithDisplay(uint32_t durationMs) { // ฟังก์ชันหน่วงเวลาพร้อมรักษาการแสดงผลของจอ 7-Segment
+
+    for (uint32_t t = 0; t < durationMs; t += 8) {
+        // วนลูปโดยเพิ่มตัวนับครั้งละ 8 จนถึงเวลาที่กำหนด
+
+        refreshDisplay();            // เรียกอัปเดตจอ 7-Segment ระหว่างการรอ
+
+    }                                // จบการวนลูปหน่วงเวลา
+
+}                                    // จบฟังก์ชัน waitWithDisplay
+
+
+void updateLives(int lives) {         // ฟังก์ชันอัปเดตไฟ LED ตามจำนวนชีวิตที่เหลือ
+
+    if (lives >= 1) PTD->PCOR = (1U << 1); else PTD->PSOR = (1U << 1); // D1: มีชีวิตอย่างน้อย 1 ให้ติด ไม่เช่นนั้นดับ
+
+    if (lives >= 2) PTD->PCOR = (1U << 3); else PTD->PSOR = (1U << 3); // D2: มีชีวิตอย่างน้อย 2 ให้ติด ไม่เช่นนั้นดับ
+
+    if (lives >= 3) PTD->PCOR = (1U << 2); else PTD->PSOR = (1U << 2); // D3: มีชีวิตอย่างน้อย 3 ให้ติด ไม่เช่นนั้นดับ
+
+    if (lives >= 4) PTD->PCOR = (1U << 0); else PTD->PSOR = (1U << 0); // D4: มีชีวิตครบ 4 ให้ติด ไม่เช่นนั้นดับ
+
+}                                    // จบฟังก์ชัน updateLives
+
+
+void beep(uint32_t durationMs) {      // ฟังก์ชันสร้างเสียง Buzzer ตามระยะเวลาที่กำหนด
+
+    buzzerOn();                      // เปิด Buzzer ให้เกิดเสียง
+
+    waitWithDisplay(durationMs);     // รอเวลาตามที่กำหนด พร้อมอัปเดตจอ 7-Segment
+
+    buzzerOff();                     // ปิด Buzzer เมื่อครบเวลาที่กำหนด
+
+}                                    // จบฟังก์ชัน beep
+
+
+void setAllRowsHigh(void) {           // ฟังก์ชันกำหนดให้ขา Row ของ Keypad ทุกแถวเป็น HIGH
+
+    PTA->PSOR = (1U << 2);            // กำหนด PTA2 เป็น HIGH สำหรับ Row 1
+
+    PTC->PSOR = (1U << 2) | (1U << 4) | (1U << 10);
+    // กำหนด PTC2, PTC4 และ PTC10 เป็น HIGH สำหรับ Row 2, 3 และ 4
+
+}                                    // จบฟังก์ชัน setAllRowsHigh
+
+
+void setRowLow(int r) {               // ฟังก์ชันเลือกแถวของ Keypad โดยกำหนดแถวที่ต้องการเป็น LOW
+
+    setAllRowsHigh();                // ตั้งค่า Row ทุกแถวเป็น HIGH ก่อนเลือกแถวใหม่
+
+    if (r == 0) PTA->PCOR = (1U << 2); // ถ้า r เท่ากับ 0 ให้ Row 1 เป็น LOW
+
+    else if (r == 1) PTC->PCOR = (1U << 2); // ถ้า r เท่ากับ 1 ให้ Row 2 เป็น LOW
+
+    else if (r == 2) PTC->PCOR = (1U << 4); // ถ้า r เท่ากับ 2 ให้ Row 3 เป็น LOW
+
+    else if (r == 3) PTC->PCOR = (1U << 10); // ถ้า r เท่ากับ 3 ให้ Row 4 เป็น LOW
+
+}                                    // จบฟังก์ชัน setRowLow
+
+
+bool isColLow(int c) {                // ฟังก์ชันตรวจสอบว่าคอลัมน์ของ Keypad มีสถานะเป็น LOW หรือไม่
+
+    if (c == 0) return (PTC->PDIR & (1U << 11)) == 0; // ตรวจสอบ Column 1 ที่ PTC11 ถ้าเป็น LOW ให้คืนค่า true
+
+    if (c == 1) return (PTB->PDIR & (1U << 9))  == 0; // ตรวจสอบ Column 2 ที่ PTB9 ถ้าเป็น LOW ให้คืนค่า true
+
+    if (c == 2) return (PTC->PDIR & (1U << 17)) == 0; // ตรวจสอบ Column 3 ที่ PTC17 ถ้าเป็น LOW ให้คืนค่า true
+
+    return false;                    // ถ้าไม่ใช่คอลัมน์ 0, 1 หรือ 2 ให้คืนค่า false
+
+}                                    // จบฟังก์ชัน isColLow
+
+
+char scanKeypad(void) {               // ฟังก์ชันสแกน Keypad เพื่ออ่านปุ่มที่ผู้เล่นกด
+
+    for (int r = 0; r < 4; r++) {     // วนตรวจสอบแถวของ Keypad ตั้งแต่แถวที่ 0 ถึง 3
+
+        setRowLow(r);                // กำหนดแถวปัจจุบันให้เป็น LOW เพื่อใช้ตรวจจับปุ่ม
+
+        delay_short();               // หน่วงเวลาสั้น ๆ เพื่อให้สถานะสัญญาณคงที่ก่อนอ่านค่า
+
+        for (int c = 0; c < 3; c++) { // วนตรวจสอบคอลัมน์ตั้งแต่คอลัมน์ที่ 0 ถึง 2
+
+            if (isColLow(c)) {       // ตรวจสอบว่าคอลัมน์ปัจจุบันมีสถานะ LOW หรือไม่
+
+                delay_ms(12);        // หน่วงเวลา 12 มิลลิวินาทีเพื่อป้องกันสัญญาณเด้ง (Debounce)
+
+                if (isColLow(c)) {   // ตรวจสอบสถานะคอลัมน์ซ้ำอีกครั้งหลังหน่วงเวลา
+
+                    setAllRowsHigh(); // ตั้งค่า Row ทุกแถวเป็น HIGH ก่อนส่งค่าปุ่มกลับ
+
+                    return keymap[r][c]; // คืนค่าปุ่มที่ตรงกับตำแหน่งแถวและคอลัมน์ที่ตรวจพบ
+
+                }                    // จบเงื่อนไขตรวจสอบปุ่มซ้ำ
+
+            }                        // จบเงื่อนไขตรวจพบคอลัมน์ LOW
+
+        }                            // จบการตรวจสอบคอลัมน์
+
+    }                                // จบการตรวจสอบแถวทั้งหมด
+
+    setAllRowsHigh();                // หากไม่พบปุ่ม ให้ตั้งค่า Row ทุกแถวเป็น HIGH
+
+    return '\0';                     // คืนค่าอักขระว่าง เพื่อบอกว่าไม่มีการกดปุ่ม
+
+}                                    // จบฟังก์ชัน scanKeypad
+
+
+int readDifficultySwitch(void) {      // ฟังก์ชันอ่านสถานะ Switch เพื่อเลือกระดับความยากของเกม
+
+    if ((PTB->PDIR & (1U << 3))  == 0) return 1; // ถ้า PTB3 เป็น LOW แสดงว่ากด S1 ให้คืนค่า 1
+
+    if ((PTB->PDIR & (1U << 10)) == 0) return 2; // ถ้า PTB10 เป็น LOW แสดงว่ากด S2 ให้คืนค่า 2
+
+    if ((PTB->PDIR & (1U << 11)) == 0) return 3; // ถ้า PTB11 เป็น LOW แสดงว่ากด S3 ให้คืนค่า 3
+
+    return 0;                        // ถ้าไม่มี Switch ตัวใดถูกกด ให้คืนค่า 0
+
+}                                    // จบฟังก์ชัน readDifficultySwitch
+
+
+// Countdown 1 -> 2 -> 3 with buzzer beep ONLY here
+// ฟังก์ชันนับถอยหลัง 1 ถึง 3 พร้อมเสียง Buzzer เฉพาะช่วงนี้
+
+
+void playCountdown(void) {            // ฟังก์ชันแสดงการนับถอยหลังก่อนเริ่มเกม
+
+    for (int count = 1; count <= 3; count++) {
+        // วนลูปนับค่าตั้งแต่ 1 ถึง 3
+
+        displayBuf[0] = 0xFF;         // ปิดการแสดงผลหลักที่ 1
+
+        displayBuf[1] = segDigits[count]; // แสดงตัวเลขนับถอยหลังที่หลักที่ 2
+
+        displayBuf[2] = 0xFF;         // ปิดการแสดงผลหลักที่ 3
+
+        displayBuf[3] = 0xFF;         // ปิดการแสดงผลหลักที่ 4
+
+        beep(70);                    // เปิดเสียง Buzzer เป็นเวลา 70 มิลลิวินาที
+
+        waitWithDisplay(630);        // รออีก 630 มิลลิวินาที พร้อมอัปเดตจอแสดงผล
+
+    }                                // จบการนับถอยหลังครบ 3 รอบ
+
+    buzzerOff();                     // ตรวจสอบให้แน่ใจว่า Buzzer อยู่ในสถานะปิด
+
+    for (int i = 0; i < 4; i++) displayBuf[i] = 0xFF;
+    // วนลูปปิดการแสดงผลทั้ง 4 หลัก โดยกำหนดรหัส 0xFF
+
+    waitWithDisplay(150);            // เว้นช่วง 150 มิลลิวินาทีก่อนเริ่มเกม
+
+}                                    // จบฟังก์ชัน playCountdown
+
+
+int main(void) {                     // ฟังก์ชันหลักของโปรแกรม เป็นจุดเริ่มต้นการทำงานของเกม
+
+    SystemCoreClockUpdate();         // อัปเดตค่าความถี่ Clock ของระบบให้ตรงกับการตั้งค่าปัจจุบัน
+
+    SysTick_Config(SystemCoreClock / 1000U);
+    // ตั้งค่า SysTick ให้เกิด Interrupt ทุก 1 มิลลิวินาที
+
+    initHardware();                  // เรียกฟังก์ชันเริ่มต้นการตั้งค่าขาและอุปกรณ์ฮาร์ดแวร์ทั้งหมด
+
+    buzzerOff();                     // สั่งปิด Buzzer เพื่อให้เริ่มต้นด้วยสถานะไม่มีเสียง
+
+
+    unsigned int seedCounter = 0;    // ตัวแปรนับค่า Seed สำหรับใช้กำหนดค่าเริ่มต้นในการสุ่มตัวเลข
+
+    int highScore = 0;               // ตัวแปรเก็บคะแนนสูงสุด เริ่มต้นที่ 0
+
+
+    while (1) {                      // วนลูปหลักตลอดเวลา เพื่อให้เกมสามารถกลับมาเริ่มใหม่ได้หลังจบเกม
+
+        // 1. Start Screen: "PLAY" + 4 Lives
+        // หน้าจอเริ่มต้น แสดงคำว่า PLAY และชีวิต 4 หน่วย
+
+        buzzerOff();                 // ปิด Buzzer ก่อนเข้าสู่หน้าเริ่มเกม
+
+        displayBuf[0] = 0x8C;        // กำหนดข้อมูลสำหรับแสดงตัวอักษร P ที่หลักที่ 1
+
+        displayBuf[1] = 0xC7;        // กำหนดข้อมูลสำหรับแสดงตัวอักษร L ที่หลักที่ 2
+
+        displayBuf[2] = 0x88;        // กำหนดข้อมูลสำหรับแสดงตัวอักษร A ที่หลักที่ 3
+
+        displayBuf[3] = 0x91;        // กำหนดข้อมูลสำหรับแสดงตัวอักษร Y ที่หลักที่ 4
+
+        updateLives(4);              // กำหนดให้ LED แสดงจำนวนชีวิตเริ่มต้นครบ 4 ดวง
+
+
+        int selectedMode = 0;        // ตัวแปรเก็บระดับความยากที่ผู้เล่นเลือก โดยเริ่มต้นเป็น 0 หมายถึงยังไม่เลือก
+
+        while (selectedMode == 0) {  // วนรอจนกว่าผู้เล่นจะกด Switch เลือกระดับความยาก
+
+            refreshDisplay();        // อัปเดตจอ 7-Segment เพื่อให้คำว่า PLAY แสดงต่อเนื่อง
+
+            seedCounter++;           // เพิ่มค่าตัวนับ Seed ระหว่างรอผู้เล่นเลือกโหมด
+
+            selectedMode = readDifficultySwitch(); // อ่าน Switch และเก็บระดับความยากที่ผู้เล่นเลือก
+
+        }                            // จบลูปรอเลือกโหมด
+
+
+        // Wait until switch is released before starting
+        // รอให้ผู้เล่นปล่อย Switch ก่อนเริ่มเกม
+
+        while (readDifficultySwitch() != 0) { // วนรอจนกว่าจะไม่มี Switch ถูกกด
+
+            refreshDisplay();        // อัปเดตจอระหว่างรอให้ปล่อย Switch
+
+            seedCounter++;           // เพิ่มค่าตัวนับ Seed ระหว่างรอ
+
+        }                            // จบลูปรอการปล่อย Switch
+
+
+        int numDigits = 2;           // กำหนดจำนวนหลักเริ่มต้นเป็น 2 หลัก
+
+        int baseTimeMs = 3000;       // กำหนดเวลาเริ่มต้นเป็น 3,000 มิลลิวินาที
+
+        int minTimeMs  = 1600;       // กำหนดเวลาต่ำสุดเป็น 1,600 มิลลิวินาที
+
+        int stepDropMs = 200;        // กำหนดจำนวนเวลาที่ลดลงต่อระดับเป็น 200 มิลลิวินาที
+
+
+        if (selectedMode == 1) {     // ตรวจสอบว่าผู้เล่นเลือก Switch S1 หรือไม่
+
+            numDigits  = 2;          // S1 ใช้ตัวเลข 2 หลัก
+
+            baseTimeMs = 3000;       // S1 มีเวลาเริ่มต้น 3,000 มิลลิวินาที
+
+            minTimeMs  = 1600;       // S1 มีเวลาต่ำสุด 1,600 มิลลิวินาที
+
+            stepDropMs = 200;        // S1 ลดเวลาลงครั้งละ 200 มิลลิวินาที
+
+        } else if (selectedMode == 2) { // หากไม่ใช่ S1 ให้ตรวจสอบว่าเป็น S2 หรือไม่
+
+            numDigits  = 3;          // S2 ใช้ตัวเลข 3 หลัก
+
+            baseTimeMs = 6000;       // S2 มีเวลาเริ่มต้น 6,000 มิลลิวินาที
+
+            minTimeMs  = 3200;       // S2 มีเวลาต่ำสุด 3,200 มิลลิวินาที
+
+            stepDropMs = 350;        // S2 ลดเวลาลงครั้งละ 350 มิลลิวินาที
+
+        } else if (selectedMode == 3) { // หากไม่ใช่ S1 หรือ S2 ให้ตรวจสอบว่าเป็น S3 หรือไม่
+
+            numDigits  = 4;          // S3 ใช้ตัวเลข 4 หลัก
+
+            baseTimeMs = 9000;       // S3 มีเวลาเริ่มต้น 9,000 มิลลิวินาที
+
+            minTimeMs  = 4800;       // S3 มีเวลาต่ำสุด 4,800 มิลลิวินาที
+
+            stepDropMs = 500;        // S3 ลดเวลาลงครั้งละ 500 มิลลิวินาที
+
+        }                            // จบการกำหนดค่าตามระดับความยาก
+
+
+        srand(seedCounter);          // กำหนดค่า Seed ให้ระบบสุ่มตัวเลข โดยใช้ seedCounter เป็นค่าเริ่มต้น
+
+
+        // 2. Countdown 1 - 2 - 3 (Buzzer sounds here only)
+        // เริ่มนับถอยหลัง 1 ถึง 3 โดย Buzzer จะส่งเสียงเฉพาะช่วงนี้
+
+        playCountdown();             // เรียกฟังก์ชันนับถอยหลังก่อนเริ่มเล่นเกม
+
+
+        // 3. Main Gameplay (Silent Buzzer)
+        // เริ่มเข้าสู่ระบบเล่นเกม โดยไม่มีเสียง Buzzer
+
+        int lives = 4;                // กำหนดจำนวนชีวิตเริ่มต้นของผู้เล่นเป็น 4
+
+        int score = 0;                // กำหนดคะแนนเริ่มต้นเป็น 0
+
+        int combo = 0;                // กำหนดจำนวนครั้งที่ตอบถูกติดต่อกันเริ่มต้นเป็น 0
+
+        int target[4] = {0};          // สร้างอาร์เรย์เก็บตัวเลขเป้าหมายสูงสุด 4 หลัก และกำหนดค่าเริ่มต้นเป็น 0
+
+
+        while (lives > 0) {           // วนเล่นเกมตราบใดที่ผู้เล่นยังมีชีวิตเหลือมากกว่า 0
+
+
+            // Calculate current time limit (gets slightly faster every 3 points)
+            // คำนวณเวลาที่อนุญาตให้ตอบ โดยเวลาจะลดลงทุกครั้งที่ได้คะแนนครบ 3 คะแนน
+
+            int level = score / 3;    // คำนวณระดับความยากจากคะแนน โดยหารคะแนนด้วย 3 แบบจำนวนเต็ม
+
+            int currentLimitMs = baseTimeMs - (level * stepDropMs);
+            // คำนวณเวลาปัจจุบัน โดยนำเวลาเริ่มต้นลบด้วยระดับคูณเวลาที่ลดลงต่อระดับ
+
+            if (currentLimitMs < minTimeMs) { // ตรวจสอบว่าเวลาปัจจุบันต่ำกว่าเวลาขั้นต่ำหรือไม่
+
+                currentLimitMs = minTimeMs; // หากต่ำกว่า ให้กำหนดเวลาเท่ากับเวลาขั้นต่ำ
+
+            }                            // จบการตรวจสอบเวลาขั้นต่ำ
+
+
+            // Generate random digits for active slots
+            // สุ่มตัวเลขสำหรับตำแหน่งหลักที่ใช้งานในระดับความยากที่เลือก
+
+            for (int i = 0; i < 4; i++) { // วนลูปตรวจสอบตำแหน่งตัวเลขทั้ง 4 หลัก
+
+                if (i < numDigits) {     // ตรวจสอบว่าตำแหน่งปัจจุบันอยู่ในจำนวนหลักที่เกมกำหนดหรือไม่
+
+                    target[i] = rand() % 10; // สุ่มตัวเลข 0-9 แล้วเก็บไว้ในอาร์เรย์ target
+
+                    displayBuf[i] = segDigits[target[i]]; // นำตัวเลขที่สุ่มได้ไปแปลงเป็นรหัส 7-Segment เพื่อแสดงผล
+
+                } else {                 // หากตำแหน่งปัจจุบันเกินจำนวนหลักที่กำหนด
+
+                    displayBuf[i] = 0xFF; // กำหนดรหัสปิดการแสดงผลของหลักนั้น
+
+                }                        // จบการตรวจสอบจำนวนหลัก
+
+            }                            // จบการสุ่มตัวเลขทั้ง 4 ตำแหน่ง
+
+
+            int currentIndex = 0;        // ตัวแปรระบุตำแหน่งตัวเลขที่ผู้เล่นต้องตอบ เริ่มจากหลักแรก
+
+            int elapsedMs = 0;           // ตัวแปรเก็บเวลาที่ใช้ไปในรอบปัจจุบัน โดยเพิ่มครั้งละ 8
+
+            bool roundSuccess = false;   // ตัวแปรตรวจสอบว่าผู้เล่นตอบถูกครบทุกหลักหรือไม่ เริ่มต้นเป็น false
+
+            char lastKey = '\0';         // เก็บปุ่มที่กดล่าสุด เริ่มต้นเป็นอักขระว่าง
+
+            int releaseCount = 0;        // ตัวนับจำนวนครั้งที่ตรวจไม่พบการกดปุ่ม
+
+
+            while (elapsedMs < currentLimitMs) { // วนตรวจสอบคำตอบตราบใดที่เวลายังไม่เกินเวลาที่กำหนด
+
+                refreshDisplay();        // อัปเดตการแสดงผลตัวเลขบน 7-Segment
+
+                elapsedMs += 8;          // เพิ่มเวลาที่นับได้ในลูปครั้งละ 8 มิลลิวินาที
+
+
+                char k = scanKeypad();   // อ่านปุ่มที่ผู้เล่นกดจาก Keypad แล้วเก็บไว้ในตัวแปร k
+
+                if (k != '\0') {         // ตรวจสอบว่ามีการกดปุ่มหรือไม่ โดยไม่ใช่อักขระว่าง
+
+                    releaseCount = 0;    // รีเซ็ตตัวนับการปล่อยปุ่ม เพราะตรวจพบว่ามีการกดปุ่ม
+
+                    if (k != lastKey) {  // ตรวจสอบว่าปุ่มที่กดปัจจุบันแตกต่างจากปุ่มล่าสุดหรือไม่
+
+                        lastKey = k;     // บันทึกปุ่มปัจจุบันไว้เป็นปุ่มล่าสุด
+
+                        if (k >= '0' && k <= '9') { // ตรวจสอบว่าปุ่มที่กดเป็นตัวเลข 0 ถึง 9 หรือไม่
+
+                            if ((k - '0') == target[currentIndex]) {
+                                // แปลงตัวอักษรที่กดเป็นตัวเลข แล้วเปรียบเทียบกับตัวเลขเป้าหมายในตำแหน่งปัจจุบัน
+
+                                displayBuf[currentIndex] = 0xFF; // หากตอบถูก ให้ซ่อนตัวเลขตำแหน่งที่ตอบแล้ว
+
+                                currentIndex++; // เพิ่มตำแหน่งไปยังตัวเลขหลักถัดไป
+
+                                if (currentIndex >= numDigits) { // ตรวจสอบว่าตอบถูกครบทุกหลักแล้วหรือยัง
+
+                                    roundSuccess = true; // กำหนดว่ารอบนี้ตอบถูกครบทุกหลัก
+
+                                    break;                 // ออกจากลูปรอคำตอบ เพราะตอบถูกครบแล้ว
+
+                                }                          // จบการตรวจสอบว่าตอบครบหรือไม่
+
+                            } else {                       // หากตัวเลขที่กดไม่ตรงกับตัวเลขเป้าหมาย
+
+                                roundSuccess = false;     // กำหนดว่ารอบนี้ไม่สำเร็จเพราะตอบผิด
+
+                                break;                     // ออกจากลูปรอคำตอบทันทีเมื่อกดผิด
+
+                            }                              // จบการเปรียบเทียบคำตอบ
+
+                        }                                  // จบการตรวจสอบว่าปุ่มที่กดเป็นตัวเลขหรือไม่
+
+                    }                                      // จบการตรวจสอบปุ่มซ้ำ
+
+                } else {                                   // กรณีที่ไม่พบการกดปุ่ม
+
+                    // Require 2 consecutive empty scans before allowing same key again
+                    // ต้องตรวจไม่พบปุ่มติดต่อกัน 2 ครั้ง ก่อนอนุญาตให้กดปุ่มเดิมซ้ำได้
+
+                    releaseCount++;                        // เพิ่มตัวนับเมื่อไม่พบการกดปุ่ม
+
+                    if (releaseCount >= 2) {               // ตรวจสอบว่าตรวจไม่พบปุ่มครบ 2 ครั้งหรือยัง
+
+                        lastKey = '\0';                    // รีเซ็ตปุ่มล่าสุดให้เป็นค่าว่าง เพื่ออนุญาตให้กดปุ่มเดิมใหม่
+
+                    }                                      // จบการตรวจสอบจำนวนครั้งที่ปล่อยปุ่ม
+
+                }                                          // จบเงื่อนไขการตรวจสอบการกดปุ่ม
+
+            }                                              // จบลูปรอคำตอบเมื่อหมดเวลาหรือตอบครบหรือกดผิด
+
+
+            if (roundSuccess) {                            // ตรวจสอบว่ารอบนี้ผู้เล่นตอบถูกครบทุกหลักหรือไม่
+
+                score++;                                   // เพิ่มคะแนนขึ้น 1 คะแนนเมื่อผู้เล่นตอบถูกครบ
+
+                combo++;                                   // เพิ่ม Combo ขึ้น 1 เมื่อผู้เล่นตอบถูกติดต่อกัน
+
+                if (score > highScore) {                   // ตรวจสอบว่าคะแนนปัจจุบันมากกว่าคะแนนสูงสุดหรือไม่
+
+                    highScore = score;                     // บันทึกคะแนนปัจจุบันเป็นคะแนนสูงสุดใหม่
+
+                }                                          // จบการตรวจสอบคะแนนสูงสุด
+
+
+                // Bonus: 5 streak restores 1 life
+                // โบนัสเมื่อผู้เล่นตอบถูกติดต่อกันครบ 5 รอบ จะได้รับชีวิตเพิ่ม 1 หน่วย
+
+                if (combo >= 5) {                          // ตรวจสอบว่าจำนวน Combo ถึง 5 หรือมากกว่าหรือไม่
+
+                    combo = 0;                             // รีเซ็ต Combo กลับเป็น 0 หลังได้รับโบนัส
+
+                    if (lives < 4) {                       // ตรวจสอบว่าจำนวนชีวิตยังน้อยกว่า 4 หรือไม่
+
+                        lives++;                           // เพิ่มจำนวนชีวิตขึ้น 1 หน่วย
+
+                        updateLives(lives);                // อัปเดต LED ให้แสดงจำนวนชีวิตใหม่
+
+                    }                                      // จบการตรวจสอบจำนวนชีวิตก่อนรับโบนัส
+
+                }                                          // จบระบบโบนัส Combo
+
+            } else {                                       // กรณีผู้เล่นตอบผิดหรือหมดเวลา
+
+                combo = 0;                                 // รีเซ็ต Combo เป็น 0 เพราะตอบไม่ถูกติดต่อกันแล้ว
+
+                lives--;                                   // ลดจำนวนชีวิตลง 1 หน่วย
+
+                updateLives(lives);                        // อัปเดต LED ให้ตรงกับจำนวนชีวิตที่เหลือ
+
+            }                                              // จบการตรวจสอบผลลัพธ์ของรอบ
+
+
+            // Short pause between rounds
+            // เว้นช่วงเวลาสั้น ๆ ระหว่างการเล่นแต่ละรอบ
+
+            for (int i = 0; i < 4; i++) displayBuf[i] = 0xFF;
+            // วนลูปปิดการแสดงผลของ 7-Segment ทั้ง 4 หลัก
+
+            waitWithDisplay(250);                          // รอ 250 มิลลิวินาที ก่อนเริ่มรอบใหม่
+
+        }                                                  // จบลูปเล่นเกมเมื่อชีวิตเหลือ 0
+
+
+        // 4. Game Over: Alternate between Score ("SCxx") and High Score ("HIxx")
+        // หน้าจอ Game Over สลับแสดงคะแนนปัจจุบันและคะแนนสูงสุด
+
+        int toggleTimer = 0;                               // ตัวแปรนับเวลาสำหรับสลับหน้าจอแสดงคะแนน
+
+        bool showHigh = false;                             // ตัวแปรกำหนดว่าจะแสดงคะแนนปัจจุบันหรือคะแนนสูงสุด โดยเริ่มจากคะแนนปัจจุบัน
+
+
+        while (readDifficultySwitch() == 0) {              // วนแสดงหน้า Game Over จนกว่าจะมีการกด Switch
+
+            if (!showHigh) {                               // หาก showHigh เป็น false ให้แสดงคะแนนปัจจุบัน
+
+                displayBuf[0] = 0x92;                      // แสดงตัวอักษร S ที่หลักที่ 1
+
+                displayBuf[1] = 0xC6;                      // แสดงตัวอักษร C ที่หลักที่ 2
+
+                displayBuf[2] = segDigits[(score / 10) % 10];
+                // แสดงเลขหลักสิบของคะแนนปัจจุบัน
+
+                displayBuf[3] = segDigits[score % 10];
+                // แสดงเลขหลักหน่วยของคะแนนปัจจุบัน
+
+            } else {                                       // หาก showHigh เป็น true ให้แสดงคะแนนสูงสุด
+
+                displayBuf[0] = 0x89;                      // แสดงตัวอักษร H ที่หลักที่ 1
+
+                displayBuf[1] = 0xF9;                      // แสดงตัวอักษร I ที่หลักที่ 2
+
+                displayBuf[2] = segDigits[(highScore / 10) % 10];
+                // แสดงเลขหลักสิบของคะแนนสูงสุด
+
+                displayBuf[3] = segDigits[highScore % 10];
+                // แสดงเลขหลักหน่วยของคะแนนสูงสุด
+
+            }                                              // จบเงื่อนไขการเลือกหน้าจอคะแนน
+
+
+            refreshDisplay();                              // อัปเดตจอ 7-Segment ให้แสดงผลตามข้อมูลปัจจุบัน
+
+            toggleTimer += 8;                              // เพิ่มตัวนับเวลาสำหรับสลับหน้าจอครั้งละ 8 หน่วย
+
+            if (toggleTimer >= 1200) {                     // ตรวจสอบว่าตัวนับเวลาถึง 1,200 แล้วหรือไม่
+
+                toggleTimer = 0;                           // รีเซ็ตตัวนับเวลากลับเป็น 0
+
+                showHigh = !showHigh;                      // สลับสถานะระหว่างแสดงคะแนนปัจจุบันกับคะแนนสูงสุด
+
+            }                                              // จบการตรวจสอบเวลาสลับหน้าจอ
+
+        }                                                  // จบลูปหน้า Game Over เมื่อมีการกด Switch
+
+
+        // Wait until switch released before returning to PLAY
+        // รอจนกว่าผู้เล่นจะปล่อย Switch ก่อนกลับไปหน้าเริ่มต้น
+
+        while (readDifficultySwitch() != 0) {               // วนรอในขณะที่ยังมี Switch ถูกกดอยู่
+
+            refreshDisplay();                              // อัปเดตจอแสดงผลระหว่างรอให้ปล่อย Switch
+
+        }                                                  // จบลูปรอการปล่อย Switch
+
+
+    }                                                      // จบลูปหลักของเกม แต่ while(1) จะทำให้เริ่มต้นใหม่ได้ตลอด
+
+}                                                          // จบฟังก์ชัน main
